@@ -52,6 +52,7 @@ ATTACH=$(hdiutil attach -readwrite -noverify -noautoopen "$RW")
 DEV=$(echo "$ATTACH" | grep -E '^/dev/' | head -1 | awk '{print $1}')
 MNT=$(echo "$ATTACH" | grep -E '/Volumes/' | head -1 | sed -E 's/.*(\/Volumes\/.*)$/\1/')
 sleep 2.5
+cp assets/AppIcon.icns "$MNT/.VolumeIcon.icns"   # hdiutil -srcfolder drops it, so place it on the mounted volume
 command -v SetFile >/dev/null && SetFile -a C "$MNT" || xattr -wx com.apple.FinderInfo "0000000000000000040000000000000000000000000000000000000000000000" "$MNT" 2>/dev/null || true
 osascript <<'AS' || true
 tell application "Finder"

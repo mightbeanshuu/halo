@@ -1,6 +1,6 @@
 # halo
 
-![version](https://img.shields.io/badge/version-0.4.0-orange) macOS 14+ · Swift (AppKit/SwiftUI/Charts/PDFKit) + Python 3 stdlib · no dependencies
+![version](https://img.shields.io/badge/version-0.4.1-orange) macOS 14+ · Swift (AppKit/SwiftUI/Charts/PDFKit) + Python 3 stdlib · no dependencies
 
 **Install:** open `dist/Halo-<version>.dmg` (or `./build.sh`), drag Halo to Applications, launch once — it symlinks the `halo` CLI into `~/.local/bin` and `/opt/homebrew/bin` and opens the deck. Or just `ln -s $PWD/halo /opt/homebrew/bin/halo`.
 
@@ -99,3 +99,9 @@ Bump it, run `./build.sh`, commit.
 - **Mic.** The mic button dictates on-device (Apple Speech, `en-IN`). While listening, the transcript grows
   live; when you stop, send it to any agent, add it as a to-do, or copy it. Needs Microphone + Speech
   Recognition permission the first time.
+
+## Icon and DMG
+`assets/icon.swift` renders the app icon (conic-gradient halo ring, orbiting agent nodes, status pill) to
+`assets/icon-1024.png` → `AppIcon.icns`; `assets/dmgbg.swift` renders the DMG window background. `./build.sh`
+bundles `Halo.app` (icon, mic/speech usage strings), stages a read-write image, lays out the Finder window via
+AppleScript (icon size, positions, background, volume icon) and converts it to the compressed `dist/Halo-x.y.z.dmg`.
