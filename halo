@@ -1,0 +1,721 @@
+#!/usr/bin/env python3
+"""halo — open a fresh Claude Code terminal, inject prompts, read output,
+and wrap the window in an animated wave/glow border (Claude-in-Chrome style).
+
+  halo open  <name> [--cmd claude] [--cwd DIR] [--cols 120] [--rows 40] [--no-overlay] [--shell]
+  halo send  <name> "prompt" [--no-wait] [--settle 2] [--timeout 300] [--label TEXT]
+  halo wait  <name> [--settle 2] [--timeout 300]      # wait for the screen to settle, print what's new
+  halo read  <name> [--lines 60] [--all]              # current screen (or full scrollback)
+  halo keys  <name> KEY [KEY...] [--wait]             # raw tmux keys: Enter Escape C-c Down Tab y ...
+  halo state <name> active|idle|done|error|off [label]
+  halo shot  <name> [out.png]                         # screenshot of window + halo
+  halo list
+  halo close <name>
+"""
+import argparse, json, os, subprocess, sys, time
+
+ROOT = os.path.dirname(os.path.realpath(__file__))
+HOME = os.path.expanduser("~")
+DIR = os.path.join(HOME, ".halo")
+SRC = os.path.join(ROOT, "overlay.swift")
+BIN = os.path.join(ROOT, "bin", "halo-overlay")
+PAD = 8
+
+
+def sh(cmd, check=True, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, **kw)
+
+
+def tmux(*a, check=True):
+    return sh(["tmux", *a], check=check)
+
+
+def osa(script):
+    return sh(["osascript", "-e", script]).stdout.strip()
+
+
+def die(msg, code=1):
+    print(f"halo: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def ensure_overlay():
+    if not os.path.exists(BIN) or os.path.getmtime(SRC) > os.path.getmtime(BIN):
+        os.makedirs(os.path.dirname(BIN), exist_ok=True)
+        r = sh(["swiftc", "-O", SRC, "-o", BIN], check=False)
+        if r.returncode:
+            die("overlay build failed:\n" + r.stderr)
+
+
+def list_windows(owner="Terminal", all_windows=False):
+    ensure_overlay()
+    out = sh([BIN, "list", owner] + (["--all"] if all_windows else [])).stdout
+    return [json.loads(l) for l in out.splitlines() if l.strip()]
+
+
+DECK_BIN = os.path.join(ROOT, "bin", "halo-deck")
+DECK_SRC = os.path.join(ROOT, "deck.swift")
+
+
+def ensure_deck():
+    if not os.path.exists(DECK_BIN) or os.path.getmtime(DECK_SRC) > os.path.getmtime(DECK_BIN):
+        r = sh(["swiftc", "-O", DECK_SRC, "-o", DECK_BIN], check=False)
+        if r.returncode:
+            die("deck build failed:\n" + r.stderr[-3000:])
+
+
+def deck_pid():
+    try:
+        with open(os.path.join(DIR, "deck.pid")) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+VERSION = open(os.path.join(ROOT, "VERSION")).read().strip() if os.path.exists(os.path.join(ROOT, "VERSION")) else "dev"
+
+APPS = {  # short name -> (app to open, CG owner name)
+    "chrome": ("Google Chrome", "Google Chrome"),
+    "claude-app": ("Claude", "Claude"),
+    "antigravity": ("Antigravity", "Antigravity"),
+    "cursor": ("Cursor", "Cursor"),
+    "vscode": ("Visual Studio Code", "Code"),
+    "codex-app": ("Codex", "Codex"),
+}
+# where a prompt goes in each GUI app: hotkey that focuses its chat/omnibox before we paste
+APP_HOTKEYS = {
+    "Cursor": "cmd+l", "Code": "cmd+i", "Antigravity": "cmd+l", "Google Chrome": "cmd+l",
+    "Claude": None, "Codex": None,
+}
+
+
+def send_hotkey(combo):
+    mods = {"cmd": "command down", "ctrl": "control down", "alt": "option down", "opt": "option down", "shift": "shift down"}
+    parts = combo.lower().split("+")
+    key, using = parts[-1], [mods[m] for m in parts[:-1] if m in mods]
+    u = (" using {" + ", ".join(using) + "}") if using else ""
+    osa(f'tell application "System Events" to keystroke "{key}"{u}')
+
+
+def send_app(meta, text, hotkey=None, enter=True):
+    """Prompt injection for GUI apps: raise the window, open its chat box, paste, Enter."""
+    app, owner, win = meta["app"], meta.get("owner", meta["app"]), meta.get("window")
+    osa(f'tell application "{app}" to activate')
+    ws = [w for w in list_windows(owner, all_windows=True) if w["id"] == win]
+    if ws and ws[0]["name"]:
+        title = ws[0]["name"].replace('"', "'")
+        osa(f'''tell application "System Events"
+  try
+    tell process "{owner}" to perform action "AXRaise" of (first window whose name is "{title}")
+  end try
+end tell''')
+    time.sleep(0.5)
+    hk = hotkey if hotkey is not None else APP_HOTKEYS.get(owner)
+    if hk:
+        send_hotkey(hk)
+        time.sleep(0.45)
+    prev = sh(["pbpaste"], check=False).stdout
+    subprocess.run(["pbcopy"], input=text, text=True, check=False)
+    send_hotkey("cmd+v")
+    time.sleep(0.35)
+    if enter:
+        osa('tell application "System Events" to key code 36')
+    time.sleep(0.3)
+    subprocess.run(["pbcopy"], input=prev, text=True, check=False)
+
+
+def shot_window(meta, out):
+    sh(["screencapture", "-x", "-l", str(meta["window"]), out], check=False)
+    return out
+
+
+def auto_name(prefix):
+    os.makedirs(DIR, exist_ok=True)
+    taken = {f[:-5] for f in os.listdir(DIR) if f.endswith(".json")}
+    n = 1
+    while f"{prefix}{n}" in taken:
+        n += 1
+    return f"{prefix}{n}"
+
+
+def orchestrator_window():
+    """CG window id of the Terminal window this Claude session runs in (via its tty)."""
+    pid = os.environ.get("CLAUDE_PID")
+    if not pid:
+        return None
+    tty = sh(["ps", "-o", "tty=", "-p", pid], check=False).stdout.strip()
+    if not tty or tty == "??":
+        return None
+    r = osa(f'''tell application "Terminal"
+  repeat with w in windows
+    repeat with t in tabs of w
+      if tty of t ends with "{tty}" then return id of w
+    end repeat
+  end repeat
+  return ""
+end tell''')
+    return int(r) if r.strip().isdigit() else None
+
+
+# ---------------------------------------------------------------- session files
+def paths(name):
+    os.makedirs(DIR, exist_ok=True)
+    return {
+        "meta": os.path.join(DIR, f"{name}.json"),
+        "state": os.path.join(DIR, f"{name}.state"),
+        "last": os.path.join(DIR, f"{name}.last"),
+    }
+
+
+def load(name):
+    p = paths(name)
+    if not os.path.exists(p["meta"]):
+        die(f"no session '{name}' — run: halo open {name}")
+    with open(p["meta"]) as f:
+        return json.load(f)
+
+
+def save(name, meta):
+    with open(paths(name)["meta"], "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def set_state(name, state, label=""):
+    with open(paths(name)["state"], "w") as f:
+        f.write(f"{state}|{label}\n")
+
+
+def sess(name):
+    return f"halo_{name}"
+
+
+def alive(name):
+    return tmux("has-session", "-t", sess(name), check=False).returncode == 0
+
+
+# ---------------------------------------------------------------- pane capture
+def capture(name, full=True, lines=None):
+    a = ["capture-pane", "-p", "-t", sess(name)]
+    if full:
+        a += ["-S", "-"]
+    elif lines:
+        a += ["-S", f"-{lines}"]
+    out = tmux(*a).stdout
+    return [l.rstrip() for l in out.split("\n")]
+
+
+def strip_trailing(lines):
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return lines
+
+
+def diff(prev, cur):
+    prev, cur = strip_trailing(list(prev)), strip_trailing(list(cur))
+    k = 0
+    while k < len(prev) and k < len(cur) and prev[k] == cur[k]:
+        k += 1
+    # the old input box gets repainted; back up over it so the echoed prompt shows
+    return cur[k:]
+
+
+def wait_settle(name, prev, settle=2.0, timeout=300, min_wait=1.0):
+    start = time.time()
+    last = capture(name)
+    changed = start
+    timed_out = False
+    while True:
+        time.sleep(0.4)
+        cur = capture(name)
+        now = time.time()
+        if cur != last:
+            last, changed = cur, now
+        elif now - changed >= settle and now - start >= min_wait:
+            break
+        if now - start > timeout:
+            timed_out = True
+            break
+    with open(paths(name)["last"], "w") as f:
+        f.write("\n".join(cur))
+    return diff(prev, cur), timed_out, cur
+
+
+def read_last(name):
+    p = paths(name)["last"]
+    if os.path.exists(p):
+        with open(p) as f:
+            return f.read().split("\n")
+    return []
+
+
+# ---------------------------------------------------------------- commands
+def close_window_by_cg(owner, win):
+    """Close an app window by matching its title from the CG list (System Events)."""
+    ws = [w for w in list_windows(owner, all_windows=True) if w["id"] == win]
+    if not ws:
+        return
+    title = ws[0]["name"].replace('"', "'")
+    osa(f'''tell application "System Events"
+  try
+    tell process "{owner}"
+      click button 1 of (first window whose name is "{title}")
+    end tell
+  end try
+end tell''')
+
+
+def cmd_focus(a):
+    meta = load(a.name)
+    if meta.get("kind") == "app":
+        osa(f'tell application "{meta["app"]}" to activate')
+    else:
+        osa(f'tell application "Terminal"\nset index of window id {meta["window"]} to 1\nactivate\nend tell')
+    print(f"[halo] focused '{a.name}'")
+
+
+def cmd_deck(a):
+    ensure_deck()
+    if a.action == "stop":
+        pid = deck_pid()
+        if focus_on():
+            cmd_full(argparse.Namespace(action="off"))
+        if pid:
+            sh(["kill", str(pid)], check=False)
+            print("[halo] deck stopped")
+        else:
+            print("[halo] deck not running")
+        return
+    if deck_pid():
+        die("deck already running (halo deck stop)")
+    orch = a.orch or orchestrator_window()
+    args = [DECK_BIN]
+    if orch:
+        args += ["--orch", str(orch)]
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if sid:
+        args += ["--orch-session", sid]
+    if not a.no_clean:
+        args += ["--clean"]
+    if a.focus:
+        args += ["--focus"]
+    # the deck draws every halo itself — retire per-session overlays
+    for f in os.listdir(DIR):
+        if f.endswith(".json"):
+            with open(os.path.join(DIR, f)) as fh:
+                m = json.load(fh)
+            if m.get("overlay_pid"):
+                sh(["kill", str(m["overlay_pid"])], check=False)
+                m["overlay_pid"] = None
+                save(m["name"], m)
+    p = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=open(os.path.join(DIR, "deck.log"), "a"), start_new_session=True)
+    with open(os.path.join(DIR, "deck.pid"), "w") as f:
+        f.write(str(p.pid))
+    print(f"[halo] deck running (pid {p.pid}, orchestrator window {orch})")
+    if a.focus:
+        time.sleep(1.5)
+        cmd_full(argparse.Namespace(action="on"))
+
+
+def cmd_hud(a):
+    """Drive the deck HUD: tab agents|files · select PATH · clean on|off · connectors on|off"""
+    if not deck_pid():
+        die("deck not running (halo deck)")
+    args = list(a.args)
+    if args and args[0] == "select" and len(args) > 1:
+        args[1] = os.path.abspath(args[1])
+    with open(os.path.join(DIR, "deck.cmd"), "a") as f:
+        f.write(" ".join(args) + "\n")
+    print(f"[halo] hud: {' '.join(args)}")
+
+
+FOCUS_FILE = os.path.join(DIR, "focus.json")
+
+
+def focus_on():
+    return os.path.exists(FOCUS_FILE)
+
+
+def cmd_full(a):
+    """Focused full-screen workspace: hide Dock + menu bar, clean backdrop, tile everything edge to edge."""
+    if a.action == "on":
+        if not focus_on():
+            prev = osa('tell application "System Events" to get {autohide, autohide menu bar} of dock preferences')
+            with open(FOCUS_FILE, "w") as f:
+                json.dump({"prev": prev, "since": time.time()}, f)
+            osa('tell application "System Events" to tell dock preferences to set {autohide, autohide menu bar} to {true, true}')
+        if deck_pid():
+            with open(os.path.join(DIR, "deck.cmd"), "a") as f:
+                f.write("clean on\nfocus on\n")
+        time.sleep(0.6)
+        cmd_tile(argparse.Namespace(no_hud=False))
+        print("[halo] full-screen workspace ON (halo full off to leave)")
+    else:
+        if focus_on():
+            try:
+                with open(FOCUS_FILE) as f:
+                    prev = json.load(f).get("prev", "false, false")
+            except (OSError, ValueError):
+                prev = "false, false"
+            a1, a2 = [x.strip() for x in prev.split(",")][:2]
+            osa(f'tell application "System Events" to tell dock preferences to set {{autohide, autohide menu bar}} to {{{a1}, {a2}}}')
+            os.remove(FOCUS_FILE)
+        if deck_pid():
+            with open(os.path.join(DIR, "deck.cmd"), "a") as f:
+                f.write("focus off\n")
+        time.sleep(0.6)
+        cmd_tile(argparse.Namespace(no_hud=False))
+        print("[halo] full-screen workspace OFF")
+
+
+def cmd_tile(a):
+    """Tile the orchestrator + all session windows in the screen area left of the HUD."""
+    scr = json.loads(sh([BIN, "screen", "--full"] if focus_on() else [BIN, "screen"]).stdout)
+    hud = 0 if a.no_hud else 400
+    m = 8 if focus_on() else 12
+    x0, y0, W, H = scr["x"] + m, scr["y"] + m, scr["w"] - hud - 2 * m, scr["h"] - 2 * m
+    orch = orchestrator_window()
+    wins = []
+    onscreen = {}
+    for f in sorted(os.listdir(DIR)):
+        if f.endswith(".json"):
+            with open(os.path.join(DIR, f)) as fh:
+                m = json.load(fh)
+            owner = m.get("owner", "Terminal")
+            if owner not in onscreen:
+                onscreen[owner] = {w["id"] for w in list_windows(owner)}
+            if m.get("window") in onscreen[owner]:
+                wins.append((owner, m["window"]))
+    if orch and orch in {w["id"] for w in list_windows("Terminal")}:
+        wins.insert(0, ("Terminal", orch))
+    if not wins:
+        die("nothing to tile")
+    gap = 12
+    orch_first = bool(orch) and wins and wins[0][1] == orch
+    agents = wins[1:] if orch_first else wins
+    slots = []  # (owner, win, x1, y1, x2, y2)
+    if orch_first:
+        ow = int(W * (0.42 if agents else 1.0))
+        slots.append((wins[0][0], wins[0][1], x0, y0, x0 + ow - gap, y0 + H - gap))
+        ax0, aw = x0 + ow, W - ow
+    else:
+        ax0, aw = x0, W
+    n = len(agents)
+    if n:
+        cols = 1 if n <= 2 else 2 if n <= 6 else 3
+        rows = -(-n // cols)
+        cw, ch = aw // cols, H // rows
+        for i, (owner, win) in enumerate(agents):
+            r, c = divmod(i, cols)
+            x1, y1 = ax0 + c * cw, y0 + r * ch
+            slots.append((owner, win, x1, y1, x1 + cw - gap, y1 + ch - gap))
+    for owner, win, x1, y1, x2, y2 in slots:
+        if owner == "Terminal":
+            osa(f'tell application "Terminal" to set bounds of window id {win} to {{{x1}, {y1}, {x2}, {y2}}}')
+        else:
+            ws = [w for w in list_windows(owner, all_windows=True) if w["id"] == win]
+            if ws:
+                title = ws[0]["name"].replace('"', "'")
+                osa(f'''tell application "System Events"
+  try
+    tell process "{owner}"
+      set w to first window whose name is "{title}"
+      set position of w to {{{x1}, {y1}}}
+      set size of w to {{{x2 - x1}, {y2 - y1}}}
+    end tell
+  end try
+end tell''')
+    n = len(slots)
+    cols = rows = 0
+    print(f"[halo] tiled {n} windows" + (" (orchestrator left, agents right)" if orch_first and len(slots) > 1 else ""))
+
+def cmd_open_app(a):
+    app, owner = APPS.get(a.app.lower(), (a.app, a.app))
+    name = a.name or auto_name(a.app.lower().split()[0] + "-")
+    if os.path.exists(paths(name)["meta"]):
+        die(f"session '{name}' already exists (halo close {name} first)")
+    before = {w["id"] for w in list_windows(owner, all_windows=True)}
+    if owner == "Google Chrome":
+        osa('tell application "Google Chrome" to make new window')
+    else:
+        sh(["open", "-na", app] + (["--args", a.cwd] if a.cwd and owner in ("Cursor", "Code", "Antigravity") else []), check=False)
+    win = pid = None
+    for _ in range(80):
+        new = [w for w in list_windows(owner, all_windows=True) if w["id"] not in before and w["w"] > 200]
+        if new:
+            win, pid = new[0]["id"], new[0]["pid"]
+            break
+        time.sleep(0.25)
+    if win is None:
+        die(f"no new window from {app} appeared (owner name '{owner}')")
+    meta = {"name": name, "kind": "app", "app": app, "owner": owner, "pid": pid, "cwd": os.path.abspath(a.cwd or os.getcwd()),
+            "window": win, "overlay_pid": None, "opened": time.strftime("%Y-%m-%d %H:%M:%S"), "opened_ts": time.time()}
+    set_state(name, "idle", "ready")
+    if not a.no_overlay and not deck_pid():
+        p = subprocess.Popen([BIN, "attach", str(win), paths(name)["state"]],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        meta["overlay_pid"] = p.pid
+    save(name, meta)
+    print(f"[halo] opened '{name}'  app={app}  window={win}  pid={pid}")
+
+
+def cmd_open(a):
+    if a.count > 1:
+        for i in range(a.count):
+            b = argparse.Namespace(**vars(a)); b.count = 1; b.name = None
+            cmd_open(b)
+        return
+    if a.app:
+        return cmd_open_app(a)
+    name = a.name or auto_name(os.path.basename(a.cmd.split()[0]) + "-")
+    a.name = name
+    if alive(name):
+        die(f"session '{name}' already open (halo close {name} first)")
+    ensure_overlay()
+    cwd = os.path.abspath(a.cwd or os.getcwd())
+    env = {k: v for k, v in os.environ.items() if not k.startswith("CLAUDE")}
+    subprocess.run(["tmux", "new-session", "-d", "-s", sess(name), "-x", str(a.cols), "-y", str(a.rows), "-c", cwd],
+                   env=env, check=True)
+    for k in [k for k in os.environ if k.startswith("CLAUDE")]:
+        tmux("set-environment", "-t", sess(name), "-u", k, check=False)
+    tmux("set-option", "-t", sess(name), "status", "off", check=False)
+    tmux("set-option", "-t", sess(name), "mouse", "on", check=False)
+    tmux("set-option", "-t", sess(name), "set-titles", "on", check=False)
+    tmux("set-option", "-t", sess(name), "set-titles-string", f"halo:{name}", check=False)
+
+    # Terminal's AppleScript window ids are CGWindowIDs, so diff those — works across Spaces.
+    ids_script = 'tell application "Terminal" to return id of every window'
+    running = osa('tell application "System Events" to (name of processes) contains "Terminal"') == "true"
+    before = set(osa(ids_script).replace(",", " ").split()) if running else set()
+    attach = f"exec tmux attach -t {sess(name)}"
+    if running:
+        # no `activate`: that can switch Spaces; the window opens on whatever Space is current
+        osa(f'tell application "Terminal" to do script "{attach}"')
+    else:
+        osa('tell application "Terminal" to launch')
+        time.sleep(1.2)
+        osa(f'tell application "Terminal" to do script "{attach}" in front window')
+    win = None
+    for _ in range(40):
+        new = [i for i in osa(ids_script).replace(",", " ").split() if i not in before]
+        if new:
+            win = int(new[0])
+            break
+        time.sleep(0.15)
+    if win is None:
+        tmux("kill-session", "-t", sess(name), check=False)
+        die("could not find the new Terminal window (is Terminal allowed under Automation?)")
+    osa(f"""tell application "Terminal"
+  set number of columns of window id {win} to {a.cols}
+  set number of rows of window id {win} to {a.rows}
+end tell""")
+    as_id = str(win)
+    onscreen = any(w["id"] == win for w in list_windows())
+
+    meta = {"name": name, "kind": "tmux", "tmux": sess(name), "cwd": cwd, "window": win, "as_id": as_id, "owner": "Terminal",
+            "overlay_pid": None, "cmd": None if a.shell else a.cmd, "opened": time.strftime("%Y-%m-%d %H:%M:%S"), "opened_ts": time.time()}
+    set_state(name, "idle", "ready")
+    if win is not None and not a.no_overlay and not deck_pid():
+        p = subprocess.Popen([BIN, "attach", str(win), paths(name)["state"]],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        meta["overlay_pid"] = p.pid
+    save(name, meta)
+
+    # let the shell come up inside the attached window
+    wait_settle(name, [], settle=0.8, timeout=15, min_wait=0.5)
+    if not a.shell:
+        set_state(name, "active", f"starting {a.cmd}")
+        prev = capture(name)
+        tmux("send-keys", "-t", sess(name), "-l", a.cmd)
+        tmux("send-keys", "-t", sess(name), "Enter")
+        new, to, cur = wait_settle(name, prev, settle=a.settle, timeout=90, min_wait=2.0)
+        set_state(name, "idle", "ready")
+        print("\n".join(strip_trailing(cur)[-a.lines:]))
+    print(f"\n[halo] opened '{name}'  tmux={sess(name)}  window={win}  overlay_pid={meta['overlay_pid']}  cwd={cwd}"
+          + ("" if onscreen else "  (window is on another Space — halo shows when you switch to it)"))
+
+
+def cmd_send(a):
+    name = a.name
+    meta = load(name)
+    if meta.get("kind") == "app":
+        text = a.text if a.text != "-" else sys.stdin.read()
+        set_state(name, "active", a.label or text.strip().splitlines()[0][:48])
+        send_app(meta, text, hotkey=a.hotkey, enter=not a.no_enter)
+        out = os.path.join(DIR, f"{name}.png")
+        if not a.no_wait:
+            time.sleep(max(a.settle, 1.5))
+            shot_window(meta, out)
+            print(f"[halo] injected into {meta['app']} · window screenshot: {out}")
+        else:
+            print(f"[halo] injected into {meta['app']}")
+        set_state(name, "done", "sent")
+        return
+    if not alive(name):
+        die(f"tmux session for '{name}' is gone — halo close {name}; halo open {name}")
+    text = a.text if a.text != "-" else sys.stdin.read()
+    label = a.label or (text.strip().splitlines()[0][:48] if text.strip() else "working")
+    prev = capture(name)
+    set_state(name, "active", label)
+    buf = f"halo_{name}_{os.getpid()}"   # unique per send: concurrent sends must not share a buffer
+    tmux("set-buffer", "-b", buf, text)
+    tmux("paste-buffer", "-p", "-d", "-b", buf, "-t", sess(name))
+    time.sleep(0.35)
+    tmux("send-keys", "-t", sess(name), "Enter")
+    if a.no_wait:
+        print(f"[halo] sent to '{name}' (not waiting)")
+        return
+    new, to, cur = wait_settle(name, prev, settle=a.settle, timeout=a.timeout)
+    set_state(name, "done" if not to else "active", "done" if not to else label)
+    print("\n".join(new) if new else "\n".join(strip_trailing(cur)[-a.lines:]))
+    if to:
+        print(f"\n[halo] still running after {a.timeout}s — `halo wait {name}` to keep waiting")
+
+
+def cmd_wait(a):
+    name = a.name
+    load(name)
+    prev = read_last(name)
+    new, to, cur = wait_settle(name, prev, settle=a.settle, timeout=a.timeout, min_wait=0.5)
+    if not to:
+        set_state(name, "done", "done")
+    print("\n".join(new) if new else "\n".join(strip_trailing(cur)[-a.lines:]))
+    if to:
+        print(f"\n[halo] still running after {a.timeout}s")
+
+
+def cmd_read(a):
+    name = a.name
+    meta = load(name)
+    if meta.get("kind") == "app":
+        out = shot_window(meta, os.path.join(DIR, f"{name}.png"))
+        print(out)
+        return
+    cur = capture(name, full=a.all)
+    cur = strip_trailing(cur)
+    print("\n".join(cur if a.all else cur[-a.lines:]))
+
+
+def cmd_keys(a):
+    name = a.name
+    load(name)
+    prev = capture(name)
+    tmux("send-keys", "-t", sess(name), *a.keys)
+    if a.wait:
+        set_state(name, "active", "working")
+        new, to, cur = wait_settle(name, prev, settle=a.settle, timeout=a.timeout)
+        set_state(name, "done" if not to else "active", "done")
+        print("\n".join(new) if new else "\n".join(strip_trailing(cur)[-a.lines:]))
+    else:
+        print(f"[halo] sent keys {a.keys} to '{name}'")
+
+
+def cmd_state(a):
+    load(a.name)
+    set_state(a.name, a.state, a.label or "")
+    print(f"[halo] {a.name}: {a.state} {a.label or ''}")
+
+
+def cmd_shot(a):
+    meta = load(a.name)
+    ws = [w for w in list_windows() if w["id"] == meta.get("window")]
+    if not ws:
+        die("terminal window is not on the current Space, so it can't be captured right now")
+    w = ws[0]
+    out = a.out or os.path.join(DIR, f"{a.name}.png")
+    x, y, wd, ht = w["x"] - PAD - 6, w["y"] - PAD - 14, w["w"] + 2 * PAD + 12, w["h"] + 2 * PAD + 20
+    sh(["screencapture", "-x", "-R", f"{x},{y},{wd},{ht}", out])
+    print(out)
+
+
+def cmd_list(a):
+    os.makedirs(DIR, exist_ok=True)
+    for f in sorted(os.listdir(DIR)):
+        if f.endswith(".json"):
+            with open(os.path.join(DIR, f)) as fh:
+                m = json.load(fh)
+            st = "alive" if alive(m["name"]) else "dead"
+            try:
+                with open(paths(m["name"])["state"]) as sf:
+                    s = sf.read().strip()
+            except OSError:
+                s = "?"
+            print(f"{m['name']:<14} {st:<6} window={m.get('window')}  state={s}  cwd={m.get('cwd')}  opened={m.get('opened')}")
+
+
+def cmd_close(a):
+    p = paths(a.name)
+    meta = load(a.name)
+    set_state(a.name, "off", "")
+    if meta.get("overlay_pid"):
+        sh(["kill", str(meta["overlay_pid"])], check=False)
+    if meta.get("kind") == "app":
+        close_window_by_cg(meta.get("owner"), meta.get("window"))
+    else:
+        tmux("kill-session", "-t", sess(a.name), check=False)
+    if meta.get("as_id"):
+        osa(f'''tell application "Terminal"
+  try
+    close (every window whose id is {meta["as_id"]}) saving no
+  end try
+end tell''')
+    for k in p.values():
+        try:
+            os.remove(k)
+        except OSError:
+            pass
+    print(f"[halo] closed '{a.name}'")
+
+
+# ---------------------------------------------------------------- argparse
+def main():
+    ap = argparse.ArgumentParser(prog="halo", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--version", action="version", version=f"halo {VERSION}")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    def common(p, wait=True):
+        p.add_argument("--settle", type=float, default=2.0, help="seconds of no screen change = done")
+        p.add_argument("--timeout", type=float, default=300)
+        p.add_argument("--lines", type=int, default=60)
+
+    p = sp.add_parser("open"); p.add_argument("name", nargs="?"); p.add_argument("--cmd", default="claude")
+    p.add_argument("--app", help="GUI app session: chrome | antigravity | cursor | vscode | or an app name")
+    p.add_argument("--cwd"); p.add_argument("--cols", type=int, default=120); p.add_argument("--rows", type=int, default=40)
+    p.add_argument("--no-overlay", action="store_true"); p.add_argument("--shell", action="store_true", help="plain shell, don't start --cmd")
+    p.add_argument("--count", type=int, default=1, help="open N sessions (auto-named)")
+    common(p); p.set_defaults(fn=cmd_open)
+
+    p = sp.add_parser("send"); p.add_argument("name"); p.add_argument("text", help="prompt text, or - for stdin")
+    p.add_argument("--no-wait", action="store_true"); p.add_argument("--label")
+    p.add_argument("--hotkey", help="GUI apps: key combo that opens the chat box first, e.g. cmd+l (default per app)")
+    p.add_argument("--no-enter", action="store_true", help="GUI apps: paste without pressing Enter"); common(p); p.set_defaults(fn=cmd_send)
+
+    p = sp.add_parser("wait"); p.add_argument("name"); common(p); p.set_defaults(fn=cmd_wait)
+
+    p = sp.add_parser("read"); p.add_argument("name"); p.add_argument("--lines", type=int, default=60)
+    p.add_argument("--all", action="store_true"); p.set_defaults(fn=cmd_read)
+
+    p = sp.add_parser("keys"); p.add_argument("name"); p.add_argument("keys", nargs="+")
+    p.add_argument("--wait", action="store_true"); common(p); p.set_defaults(fn=cmd_keys)
+
+    p = sp.add_parser("state"); p.add_argument("name"); p.add_argument("state", choices=["active", "idle", "done", "error", "off"])
+    p.add_argument("label", nargs="?"); p.set_defaults(fn=cmd_state)
+
+    p = sp.add_parser("shot"); p.add_argument("name"); p.add_argument("out", nargs="?"); p.set_defaults(fn=cmd_shot)
+    p = sp.add_parser("list"); p.set_defaults(fn=cmd_list)
+    p = sp.add_parser("focus"); p.add_argument("name"); p.set_defaults(fn=cmd_focus)
+    p = sp.add_parser("deck", help="workspace: connectors + HUD (CPU, tokens, limits, files)"); p.add_argument("action", nargs="?", default="start", choices=["start", "stop"])
+    p.add_argument("--orch", type=int, help="CG window id of the orchestrator window"); p.add_argument("--no-clean", action="store_true", help="don't draw the clean backdrop"); p.add_argument("--focus", action="store_true", help="start in focused full-screen workspace")
+    p.set_defaults(fn=cmd_deck)
+    p = sp.add_parser("full", help="focused full-screen workspace on|off (Dock + menu bar hidden, everything tiled inside)"); p.add_argument("action", choices=["on", "off"]); p.set_defaults(fn=cmd_full)
+    p = sp.add_parser("hud"); p.add_argument("args", nargs="+"); p.set_defaults(fn=cmd_hud)
+    p = sp.add_parser("tile"); p.add_argument("--no-hud", action="store_true"); p.set_defaults(fn=cmd_tile)
+    p = sp.add_parser("close"); p.add_argument("name"); p.set_defaults(fn=cmd_close)
+
+    a = ap.parse_args()
+    a.fn(a)
+
+
+if __name__ == "__main__":
+    main()

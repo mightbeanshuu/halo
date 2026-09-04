@@ -1,0 +1,6 @@
+bin/
+dist/
+*.png
+*.pdf
+.DS_Store
+__pycache__/
