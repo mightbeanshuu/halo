@@ -12,7 +12,7 @@ and wrap the window in an animated wave/glow border (Claude-in-Chrome style).
   halo list
   halo close <name>
 """
-import argparse, json, os, subprocess, sys, time
+import argparse, json, os, re, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.realpath(__file__))
 HOME = os.path.expanduser("~")
@@ -133,7 +133,7 @@ def shot_window(meta, out):
 
 def auto_name(prefix):
     os.makedirs(DIR, exist_ok=True)
-    taken = {f[:-5] for f in os.listdir(DIR) if f.endswith(".json")}
+    taken = {f[:-5] for f in session_files()}
     n = 1
     while f"{prefix}{n}" in taken:
         n += 1
@@ -185,6 +185,14 @@ def save(name, meta):
 def set_state(name, state, label=""):
     with open(paths(name)["state"], "w") as f:
         f.write(f"{state}|{label}\n")
+
+
+RESERVED = {"deck", "todo", "focus"}   # ~/.halo/<these>.json are not sessions
+
+
+def session_files():
+    os.makedirs(DIR, exist_ok=True)
+    return [f for f in sorted(os.listdir(DIR)) if f.endswith(".json") and f[:-5] not in RESERVED]
 
 
 def sess(name):
@@ -250,6 +258,108 @@ def read_last(name):
     return []
 
 
+# ---------------------------------------------------------------- clean text / clipboard / todo
+CHROME_LINE = re.compile(r"^\s*(\w+@[\w.-]+ \|.*|─{3,}|━{3,}|❯.*|⏵⏵.*|\? for shortcuts.*|.*\| model:.*|.*ctrl\+b to run in background.*|.*Tip: Use /btw.*|\s*[✻✽✶✳✢·]\s+\w+…?.*·.*tokens.*|\s*[✻✽✶✳✢]\s+\w+ for \d+.*)$")
+
+
+def clean_text(lines):
+    """Strip Claude Code chrome (boxes, spinners, status line) and bullet glyphs; collapse blank runs."""
+    out, blank = [], 0
+    for l in lines:
+        if CHROME_LINE.match(l):
+            continue
+        l = re.sub(r"^\s*[⏺●]\s?", "", l)
+        l = l.rstrip()
+        if not l.strip():
+            blank += 1
+            if blank > 1:
+                continue
+        else:
+            blank = 0
+        out.append(l)
+    while out and not out[0].strip():
+        out.pop(0)
+    while out and not out[-1].strip():
+        out.pop()
+    return out
+
+
+def last_response(name):
+    """Lines of the most recent answer: from the last echoed prompt (❯ …) to the end of the pane."""
+    cur = strip_trailing(capture(name))
+    idx = max((i for i, l in enumerate(cur) if l.startswith("❯ ") and l.strip() != "❯"), default=-1)
+    return cur[idx + 1:] if idx >= 0 else cur
+
+
+def cmd_copy(a):
+    name = a.name
+    meta = load(name)
+    if meta.get("kind") == "app":
+        die("copy works on terminal sessions; for apps use halo read (screenshot)")
+    lines = capture(name, full=True) if a.all else last_response(name)
+    text = "\n".join(lines if a.raw else clean_text(lines))
+    subprocess.run(["pbcopy"], input=text, text=True, check=False)
+    print(text if a.print else f"[halo] copied {len(text.splitlines())} lines from '{name}' to the clipboard")
+
+
+def cmd_paste(a):
+    text = sh(["pbpaste"], check=False).stdout
+    if not text.strip():
+        die("clipboard is empty")
+    a.text, a.label, a.hotkey, a.no_enter = text, None, None, False
+    cmd_send(a)
+
+
+TODO_FILE = os.path.join(DIR, "todo.json")
+
+
+def todo_load():
+    try:
+        with open(TODO_FILE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def todo_save(items):
+    os.makedirs(DIR, exist_ok=True)
+    with open(TODO_FILE, "w") as f:
+        json.dump(items, f, indent=1)
+
+
+def cmd_todo(a):
+    items = todo_load()
+    act = a.action
+    if act == "add":
+        text = " ".join(a.args).strip()
+        if not text:
+            die("halo todo add \"text\"")
+        items.append({"id": int(time.time() * 1000), "text": text, "done": False, "created": time.time()})
+        todo_save(items); print(f"[halo] todo #{len(items)}: {text}")
+    elif act in ("done", "undone", "rm"):
+        if not a.args or not a.args[0].isdigit() or not 1 <= int(a.args[0]) <= len(items):
+            die("halo todo done|undone|rm N")
+        i = int(a.args[0]) - 1
+        if act == "rm":
+            print(f"[halo] removed: {items.pop(i)['text']}")
+        else:
+            items[i]["done"] = act == "done"; print(f"[halo] {'✓' if items[i]['done'] else '○'} {items[i]['text']}")
+        todo_save(items)
+    elif act == "send":
+        if len(a.args) < 2 or not a.args[0].isdigit():
+            die("halo todo send N AGENT")
+        i = int(a.args[0]) - 1
+        b = argparse.Namespace(name=a.args[1], text=items[i]["text"], no_wait=True, label=None, settle=3, timeout=300, lines=60, hotkey=None, no_enter=False)
+        cmd_send(b)
+    elif act == "clear":
+        items = [t for t in items if not t["done"]]; todo_save(items); print(f"[halo] {len(items)} open items left")
+    else:
+        for n, t in enumerate(items, 1):
+            print(f"{n:>3}. {'✓' if t['done'] else '○'} {t['text']}")
+        if not items:
+            print("(empty) — halo todo add \"...\"")
+
+
 # ---------------------------------------------------------------- commands
 def close_window_by_cg(owner, win):
     """Close an app window by matching its title from the CG list (System Events)."""
@@ -301,8 +411,8 @@ def cmd_deck(a):
     if a.focus:
         args += ["--focus"]
     # the deck draws every halo itself — retire per-session overlays
-    for f in os.listdir(DIR):
-        if f.endswith(".json"):
+    for f in session_files():
+        if True:
             with open(os.path.join(DIR, f)) as fh:
                 m = json.load(fh)
             if m.get("overlay_pid"):
@@ -378,8 +488,8 @@ def cmd_tile(a):
     orch = orchestrator_window()
     wins = []
     onscreen = {}
-    for f in sorted(os.listdir(DIR)):
-        if f.endswith(".json"):
+    for f in session_files():
+        if True:
             with open(os.path.join(DIR, f)) as fh:
                 m = json.load(fh)
             owner = m.get("owner", "Terminal")
@@ -469,6 +579,8 @@ def cmd_open(a):
     if a.app:
         return cmd_open_app(a)
     name = a.name or auto_name(os.path.basename(a.cmd.split()[0]) + "-")
+    if name in RESERVED:
+        die(f"'{name}' is a reserved name")
     a.name = name
     if alive(name):
         die(f"session '{name}' already open (halo close {name} first)")
@@ -481,6 +593,11 @@ def cmd_open(a):
         tmux("set-environment", "-t", sess(name), "-u", k, check=False)
     tmux("set-option", "-t", sess(name), "status", "off", check=False)
     tmux("set-option", "-t", sess(name), "mouse", "on", check=False)
+    tmux("set-option", "-g", "set-clipboard", "on", check=False)
+    # drag-select copies straight to the macOS clipboard; ⌘V pastes via Terminal as usual
+    tmux("bind-key", "-T", "copy-mode", "MouseDragEnd1Pane", "send-keys", "-X", "copy-pipe-and-cancel", "pbcopy", check=False)
+    tmux("bind-key", "-T", "copy-mode-vi", "MouseDragEnd1Pane", "send-keys", "-X", "copy-pipe-and-cancel", "pbcopy", check=False)
+    tmux("bind-key", "-T", "copy-mode", "Enter", "send-keys", "-X", "copy-pipe-and-cancel", "pbcopy", check=False)
     tmux("set-option", "-t", sess(name), "set-titles", "on", check=False)
     tmux("set-option", "-t", sess(name), "set-titles-string", f"halo:{name}", check=False)
 
@@ -630,9 +747,8 @@ def cmd_shot(a):
 
 
 def cmd_list(a):
-    os.makedirs(DIR, exist_ok=True)
-    for f in sorted(os.listdir(DIR)):
-        if f.endswith(".json"):
+    for f in session_files():
+        if True:
             with open(os.path.join(DIR, f)) as fh:
                 m = json.load(fh)
             st = "alive" if alive(m["name"]) else "dead"
@@ -692,6 +808,12 @@ def main():
     p.add_argument("--no-enter", action="store_true", help="GUI apps: paste without pressing Enter"); common(p); p.set_defaults(fn=cmd_send)
 
     p = sp.add_parser("wait"); p.add_argument("name"); common(p); p.set_defaults(fn=cmd_wait)
+
+    p = sp.add_parser("copy", help="copy the agent's last answer (clean text) to the clipboard"); p.add_argument("name")
+    p.add_argument("--all", action="store_true"); p.add_argument("--raw", action="store_true"); p.add_argument("--print", action="store_true"); p.set_defaults(fn=cmd_copy)
+    p = sp.add_parser("paste", help="send the clipboard as a prompt"); p.add_argument("name"); p.add_argument("--no-wait", action="store_true"); common(p); p.set_defaults(fn=cmd_paste)
+    p = sp.add_parser("todo"); p.add_argument("action", nargs="?", default="list", choices=["list", "add", "done", "undone", "rm", "send", "clear"])
+    p.add_argument("args", nargs="*"); p.set_defaults(fn=cmd_todo)
 
     p = sp.add_parser("read"); p.add_argument("name"); p.add_argument("--lines", type=int, default=60)
     p.add_argument("--all", action="store_true"); p.set_defaults(fn=cmd_read)

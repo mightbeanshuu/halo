@@ -11,6 +11,33 @@ import Cocoa
 import SwiftUI
 import Charts
 import PDFKit
+import Speech
+import AVFoundation
+import ScreenCaptureKit
+
+/// Screenshot of one window (any Space) via ScreenCaptureKit; falls back to the screencapture CLI.
+func captureWindow(_ id: CGWindowID, completion: @escaping (NSImage?) -> Void) {
+    Task {
+        do {
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+            guard let win = content.windows.first(where: { $0.windowID == id }) else { completion(captureViaCLI(id)); return }
+            let filter = SCContentFilter(desktopIndependentWindow: win)
+            let cfg = SCStreamConfiguration()
+            let scale = NSScreen.main?.backingScaleFactor ?? 2
+            cfg.width = Int(win.frame.width * scale); cfg.height = Int(win.frame.height * scale)
+            cfg.showsCursor = false
+            let cg = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
+            completion(NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height)))
+        } catch {
+            completion(captureViaCLI(id))
+        }
+    }
+}
+func captureViaCLI(_ id: CGWindowID) -> NSImage? {
+    let p = NSTemporaryDirectory() + "halo-live-\(id).png"
+    run(["screencapture", "-x", "-l", "\(id)", p])
+    return NSImage(contentsOfFile: p)
+}
 
 let HOME = FileManager.default.homeDirectoryForCurrentUser.path
 let HALO_DIR = HOME + "/.halo"
@@ -117,6 +144,22 @@ final class Session: ObservableObject, Identifiable {
     init(id: String) { self.id = id }
 }
 
+struct Todo: Identifiable, Codable, Equatable {
+    var id: Int
+    var text: String
+    var done: Bool
+    var created: Double
+}
+
+struct AgentAction: Identifiable, Equatable {
+    let id: String
+    let time: Date
+    let agent: String
+    let tool: String      // short tool name, e.g. "navigate", "computer"
+    let summary: String   // key inputs
+    var isChrome: Bool { tool.hasPrefix("chrome:") }
+}
+
 struct FileItem: Identifiable, Equatable {
     var id: String { path }
     let path: String
@@ -142,6 +185,13 @@ final class Deck: ObservableObject {
     @Published var tab = 0
     @Published var autoTile = true
     @Published var focus = false
+    @Published var todos: [Todo] = []
+    @Published var actions: [AgentAction] = []
+    @Published var liveImage: NSImage? = nil
+    @Published var liveTitle = ""
+    @Published var autoLive = true
+    @Published var liveWindowOpen = false
+    @Published var dictation = Dictation()
     var orchWindow: CGWindowID? = nil
     var orchSession: String? = nil
 }
@@ -501,8 +551,16 @@ func readStatusFiles() -> [StatusInfo] {
 }
 
 final class TranscriptReader {
-    struct Acc { var offset: UInt64 = 0; var usage: [String: (Int, Int)] = [:]; var partial = "" }
+    struct Acc { var offset: UInt64 = 0; var usage: [String: (Int, Int)] = [:]; var partial = ""; var pending: [AgentAction] = [] }
     var accs: [String: Acc] = [:]
+    static let iso: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
+    /// tool_use blocks seen since the last drain (agent name filled in by the caller)
+    func drainActions(_ path: String, agent: String) -> [AgentAction] {
+        guard var acc = accs[path] else { return [] }
+        let out = acc.pending.map { AgentAction(id: $0.id, time: $0.time, agent: agent, tool: $0.tool, summary: $0.summary) }
+        acc.pending = []; accs[path] = acc
+        return out
+    }
     func totals(_ path: String) -> (inp: Int, out: Int) {
         var acc = accs[path] ?? Acc()
         guard let fh = FileHandle(forReadingAtPath: path) else { return (0, 0) }
@@ -513,10 +571,26 @@ final class TranscriptReader {
         let text = acc.partial + String(decoding: data, as: UTF8.self)
         var lines = text.components(separatedBy: "\n")
         acc.partial = lines.removeLast()
-        for l in lines where l.contains("\"usage\"") {
+        for l in lines where l.contains("\"assistant\"") {
             guard let d = l.data(using: .utf8), let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-                  (j["type"] as? String) == "assistant", let m = j["message"] as? [String: Any],
-                  let u = m["usage"] as? [String: Any] else { continue }
+                  (j["type"] as? String) == "assistant", let m = j["message"] as? [String: Any] else { continue }
+            if let content = m["content"] as? [[String: Any]] {
+                let ts = (j["timestamp"] as? String).flatMap { TranscriptReader.iso.date(from: $0) } ?? Date()
+                for c in content where (c["type"] as? String) == "tool_use" {
+                    let name = c["name"] as? String ?? "tool"
+                    let input = c["input"] as? [String: Any] ?? [:]
+                    var tool = name
+                    if name.hasPrefix("mcp__claude-in-chrome__") { tool = "chrome:" + name.dropFirst("mcp__claude-in-chrome__".count) }
+                    else if name.hasPrefix("mcp__") { tool = name.dropFirst(5).replacingOccurrences(of: "__", with: ":") }
+                    var bits: [String] = []
+                    for k in ["action", "url", "text", "coordinate", "command", "file_path", "pattern", "description", "prompt", "query", "selector", "ref", "key"] {
+                        if let v = input[k] { let str = "\(v)".replacingOccurrences(of: "\n", with: " "); bits.append(k == "action" ? str : "\(k)=\(str.prefix(70))") }
+                    }
+                    let id = (c["id"] as? String) ?? UUID().uuidString
+                    acc.pending.append(AgentAction(id: id, time: ts, agent: "", tool: tool, summary: bits.joined(separator: " · ")))
+                }
+            }
+            guard let u = m["usage"] as? [String: Any] else { continue }
             let id = (m["id"] as? String) ?? UUID().uuidString
             let inp = (u["input_tokens"] as? Int ?? 0) + (u["cache_creation_input_tokens"] as? Int ?? 0) + (u["cache_read_input_tokens"] as? Int ?? 0)
             let out = u["output_tokens"] as? Int ?? 0
@@ -575,6 +649,9 @@ final class DeckController {
     let statsQ = DispatchQueue(label: "halo.stats", qos: .utility)
     var cleanObs: Any? = nil
     var layoutKey = "", layoutChangedAt: Date? = nil
+    var todoMtime: Date = .distantPast
+    var liveWindow: NSWindow? = nil
+    var liveTick = 0
 
     init(orch: CGWindowID?, orchSession: String?, clean: Bool) {
         deck.orchWindow = orch; deck.orchSession = orchSession
@@ -588,6 +665,7 @@ final class DeckController {
         Timer.scheduledTimer(withTimeInterval: 1.0/60.0, repeats: true) { [weak self] _ in self?.geometryTick() }
         Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in self?.metaTick() }
         Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in self?.statsTick() }
+        Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.liveCapture() }
         metaTick(); statsTick()
     }
 
@@ -637,6 +715,59 @@ final class DeckController {
         else if deck.autoTile, let t = layoutChangedAt, Date().timeIntervalSince(t) > 0.8 { layoutChangedAt = nil; tile() }
     }
 
+    // ---- todo (shared with `halo todo` through ~/.halo/todo.json)
+    func loadTodos(force: Bool = false) {
+        let p = HALO_DIR + "/todo.json"
+        let mt = (try? FileManager.default.attributesOfItem(atPath: p)[.modificationDate] as? Date) ?? .distantPast
+        guard force || mt != todoMtime else { return }
+        todoMtime = mt
+        if let d = FileManager.default.contents(atPath: p), let t = try? JSONDecoder().decode([Todo].self, from: d) {
+            if t != deck.todos { withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { deck.todos = t } }
+        } else if !FileManager.default.fileExists(atPath: p) { deck.todos = [] }
+    }
+    func saveTodos() {
+        let p = HALO_DIR + "/todo.json"
+        if let d = try? JSONEncoder().encode(deck.todos) { try? d.write(to: URL(fileURLWithPath: p)) }
+        todoMtime = (try? FileManager.default.attributesOfItem(atPath: p)[.modificationDate] as? Date) ?? .distantPast
+    }
+    func addTodo(_ text: String) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines); guard !t.isEmpty else { return }
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.8)) { deck.todos.append(Todo(id: Int(Date().timeIntervalSince1970 * 1000), text: t, done: false, created: Date().timeIntervalSince1970)) }
+        saveTodos()
+    }
+    func toggleTodo(_ t: Todo) { if let i = deck.todos.firstIndex(of: t) { withAnimation(.easeInOut(duration: 0.25)) { deck.todos[i].done.toggle() }; saveTodos() } }
+    func removeTodo(_ t: Todo) { withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { deck.todos.removeAll { $0.id == t.id } }; saveTodos() }
+    func sendTodo(_ t: Todo, to s: Session) { runAsync(["halo", "send", s.id, t.text, "--no-wait"]) }
+
+    // ---- live view of the Chrome window Claude is driving
+    func chromeWindow() -> WinInfo? {
+        let all = cgWindows(all: true)
+        if let s = deck.sessions.first(where: { $0.owner == "Google Chrome" }), let w = s.window, let i = all.first(where: { $0.id == w }) { return i }
+        return all.first { $0.owner == "Google Chrome" && $0.layer == 0 && $0.bounds.width > 300 && $0.bounds.height > 200 }
+    }
+    func liveCapture() {
+        let recentChrome = deck.actions.first.map { $0.isChrome && Date().timeIntervalSince($0.time) < 120 } ?? false
+        guard deck.tab == 2 || deck.liveWindowOpen || recentChrome else { return }
+        liveTick += 1
+        if !(deck.tab == 2 || deck.liveWindowOpen) && liveTick % 4 != 0 { return }   // background: 2 s cadence
+        guard let w = chromeWindow() else { if deck.liveImage != nil { deck.liveImage = nil }; deck.liveTitle = "no Chrome window"; return }
+        captureWindow(w.id) { [weak self] img in
+            guard let img = img else { return }
+            DispatchQueue.main.async { self?.deck.liveImage = img; self?.deck.liveTitle = w.name.isEmpty ? "Google Chrome" : w.name }
+        }
+    }
+    func toggleLiveWindow() {
+        if let w = liveWindow { w.orderOut(nil); liveWindow = nil; deck.liveWindowOpen = false; return }
+        let scr = NSScreen.screens.first?.visibleFrame ?? .zero
+        let f = NSRect(x: scr.midX - 460, y: scr.midY - 300, width: 920, height: 600)
+        let w = KeyPanel(contentRect: f, styleMask: [.titled, .closable, .resizable, .nonactivatingPanel, .fullSizeContentView], backing: .buffered, defer: false)
+        w.title = "Live · Claude in Chrome"; w.titlebarAppearsTransparent = true; w.isOpaque = false; w.backgroundColor = NSColor(white: 0.06, alpha: 0.96)
+        w.level = .floating; w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]; w.isReleasedWhenClosed = false
+        w.contentView = NSHostingView(rootView: LiveView(deck: deck, controller: self, big: true))
+        w.orderFrontRegardless()
+        liveWindow = w; deck.liveWindowOpen = true
+    }
+
     func runHUDCommands() {
         let p = HALO_DIR + "/deck.cmd"
         guard let s = try? String(contentsOfFile: p, encoding: .utf8) else { return }
@@ -647,7 +778,7 @@ final class DeckController {
             let arg = a.count > 1 ? a[1] : ""
             withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
                 switch c {
-                case "tab": deck.tab = arg == "files" ? 1 : 0
+                case "tab": deck.tab = ["agents": 0, "files": 1, "live": 2, "todo": 3][arg] ?? 0
                 case "select":
                     deck.tab = 1
                     if let f = deck.files.first(where: { $0.path == arg }) { deck.selected = f }
@@ -669,11 +800,12 @@ final class DeckController {
     // 0.4 s: session metadata + state files
     func metaTick() {
         runHUDCommands()
+        loadTodos()
         let fm = FileManager.default
         guard let names = try? fm.contentsOfDirectory(atPath: HALO_DIR) else { return }
         var seen: [String] = []
         var changed = false
-        for n in names where n.hasSuffix(".json") && n != "deck.json" {
+        for n in names where n.hasSuffix(".json") && !["deck.json", "todo.json", "focus.json"].contains(n) {
             let name = String(n.dropLast(5)); seen.append(name)
             let p = HALO_DIR + "/" + n
             var s = deck.sessions.first { $0.id == name }
@@ -731,6 +863,7 @@ final class DeckController {
             let statuses = readStatusFiles()
             var statusBy: [String: StatusInfo] = [:]
             var tokBy: [String: (Int, Int)] = [:]
+            var newActions: [AgentAction] = []
             var used = Set<String>()
             let claudeSessions = sessions.filter { $0.5 }.sorted { $0.4 < $1.4 }
             for (name, _, cwd, _, opened, _) in claudeSessions where !cwd.isEmpty {
@@ -748,9 +881,11 @@ final class DeckController {
                 let sid = String(b.0.dropLast(6))
                 if let st = statuses.first(where: { $0.sessionId == sid }) { statusBy[name] = st }
                 tokBy[name] = transcripts.totals(dir + "/" + b.0)
+                newActions += transcripts.drainActions(dir + "/" + b.0, agent: name)
             }
             let orchStatus = orchSession.flatMap { sid in statuses.first { $0.sessionId == sid } }
             let orchTok = orchStatus?.transcript.map { transcripts.totals($0) }
+            if let t = orchStatus?.transcript { newActions += transcripts.drainActions(t, agent: "you") }
             // files
             let files = recentFiles(in: cwds)
 
@@ -768,6 +903,13 @@ final class DeckController {
                     if let st = orchStatus { self.deck.orch.model = st.model; self.deck.orch.ctxPct = st.ctx; self.deck.orch.limit5h = st.l5; self.deck.orch.limit7d = st.l7; self.deck.orch.cost = st.cost }
                     if let t = orchTok { self.deck.orch.tokIn = t.0; self.deck.orch.tokOut = t.1 }
                     self.deck.tokensTotalOut = self.deck.orch.tokOut + self.deck.sessions.reduce(0) { $0 + $1.tokOut }
+                    if !newActions.isEmpty {
+                        let fresh = newActions.sorted { $0.time > $1.time }
+                        self.deck.actions = Array((fresh + self.deck.actions).prefix(60))
+                        if self.deck.autoLive, fresh.contains(where: { $0.isChrome && Date().timeIntervalSince($0.time) < 30 }), self.deck.tab != 2, !self.deck.liveWindowOpen {
+                            self.deck.tab = 2
+                        }
+                    }
                     if files != self.deck.files {
                         self.deck.files = files
                         if self.deck.selected == nil, let f = files.first { self.deck.selected = f }
@@ -830,7 +972,10 @@ struct HUDView: View {
             header
             Picker("", selection: $deck.tab) {
                 Text("Agents").tag(0); Text("Files").tag(1)
+                Text(deck.actions.first.map { $0.isChrome && Date().timeIntervalSince($0.time) < 60 } == true ? "● Live" : "Live").tag(2)
+                Text(deck.todos.filter { !$0.done }.isEmpty ? "To-do" : "To-do \(deck.todos.filter { !$0.done }.count)").tag(3)
             }.pickerStyle(.segmented).labelsHidden().padding(.horizontal, 14)
+            if deck.dictation.listening || !deck.dictation.text.isEmpty { DictationBar(deck: deck, controller: controller) }
             if deck.tab == 0 {
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 10) {
@@ -843,8 +988,12 @@ struct HUDView: View {
                     .animation(.spring(response: 0.4, dampingFraction: 0.82), value: deck.sessions.map { $0.id })
                 }
                 launchBar
-            } else {
+            } else if deck.tab == 1 {
                 FilesPanel(deck: deck, controller: controller)
+            } else if deck.tab == 2 {
+                LiveView(deck: deck, controller: controller, big: false)
+            } else {
+                TodoPanel(deck: deck, controller: controller)
             }
         }
         .padding(.top, 14).padding(.bottom, 12)
@@ -858,6 +1007,7 @@ struct HUDView: View {
                 Text("workspace").font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.5))
                 Text("v" + VERSION).font(.system(size: 9.5, weight: .semibold, design: .monospaced)).foregroundStyle(.white.opacity(0.35))
                 Spacer()
+                MicButton(deck: deck)
                 Button { controller.setFocus(!deck.focus) } label: { Image(systemName: deck.focus ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right").foregroundStyle(deck.focus ? Color.orange : Color.white) }.help(deck.focus ? "leave focused workspace" : "focused full-screen workspace")
                 Toggle(isOn: $deck.showConnectors) { Image(systemName: "arrow.triangle.branch") }.toggleStyle(.button).help("arrow connectors")
                 Toggle(isOn: $deck.clean) { Image(systemName: "rectangle.dashed") }.toggleStyle(.button).help("clean backdrop")
@@ -984,6 +1134,10 @@ struct SessionCard: View {
                         .padding(.horizontal, 8).padding(.vertical, 5)
                         .background(RoundedRectangle(cornerRadius: 7).fill(.white.opacity(0.08)))
                     IconButton("paperplane.fill", tint: .orange) { controller.send(s) }
+                    if s.kind == "tmux" {
+                        IconButton("doc.on.doc", tint: .teal) { runAsync(["halo", "copy", s.id]) }.help("copy last answer (clean text)")
+                        IconButton("doc.on.clipboard", tint: .mint) { runAsync(["halo", "paste", s.id, "--no-wait"]) }.help("send clipboard as prompt")
+                    }
                     IconButton("scope", tint: .blue) { controller.focus(s) }
                     IconButton("xmark.circle", tint: .red) { controller.close(s) }
                 }
@@ -1021,6 +1175,215 @@ struct MiniGauge: View {
                 Text(value.map { String(format: "%.0f", $0) } ?? "–").font(.system(size: 9, weight: .bold, design: .rounded))
             }.frame(width: 30, height: 30)
             Text(title).font(.system(size: 8.5, weight: .semibold)).foregroundStyle(.white.opacity(0.5))
+        }
+    }
+}
+
+// MARK: dictation (on-device speech, like a push-to-talk) ----------------------
+
+final class Dictation: ObservableObject {
+    @Published var listening = false
+    @Published var text = ""
+    @Published var level: CGFloat = 0
+    @Published var status = ""
+    private let engine = AVAudioEngine()
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-IN")) ?? SFSpeechRecognizer()
+
+    func toggle() { listening ? stop() : start() }
+
+    func start() {
+        status = "requesting mic…"
+        AVCaptureDevice.requestAccess(for: .audio) { ok in
+            guard ok else { DispatchQueue.main.async { self.status = "microphone denied (System Settings → Privacy)" }; return }
+            SFSpeechRecognizer.requestAuthorization { auth in
+                DispatchQueue.main.async {
+                    guard auth == .authorized else { self.status = "speech recognition denied"; return }
+                    self.begin()
+                }
+            }
+        }
+    }
+
+    private func begin() {
+        text = ""; status = ""
+        let req = SFSpeechAudioBufferRecognitionRequest()
+        req.shouldReportPartialResults = true
+        if recognizer?.supportsOnDeviceRecognition == true { req.requiresOnDeviceRecognition = true }
+        request = req
+        let input = engine.inputNode
+        let fmt = input.outputFormat(forBus: 0)
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buf, _ in
+            self?.request?.append(buf)
+            if let ch = buf.floatChannelData?[0] {
+                let n = Int(buf.frameLength); var sum: Float = 0
+                for i in 0..<n { sum += ch[i] * ch[i] }
+                let rms = sqrt(sum / Float(max(n, 1)))
+                DispatchQueue.main.async { self?.level = CGFloat(min(1, rms * 12)) }
+            }
+        }
+        engine.prepare()
+        do { try engine.start() } catch { status = "audio engine failed"; return }
+        listening = true
+        task = recognizer?.recognitionTask(with: req) { [weak self] res, err in
+            guard let self = self else { return }
+            DispatchQueue.main.async {
+                if let r = res { self.text = r.bestTranscription.formattedString }
+                if err != nil || res?.isFinal == true { self.finish() }
+            }
+        }
+    }
+
+    func stop() { request?.endAudio(); finish() }
+
+    private func finish() {
+        guard listening else { return }
+        engine.stop(); engine.inputNode.removeTap(onBus: 0)
+        task?.finish(); task = nil; request = nil
+        listening = false; level = 0
+    }
+    func clear() { text = ""; status = "" }
+}
+
+struct MicButton: View {
+    @ObservedObject var deck: Deck
+    @ObservedObject var d: Dictation
+    init(deck: Deck) { self.deck = deck; self.d = deck.dictation }
+    var body: some View {
+        Button { d.toggle() } label: {
+            ZStack {
+                if d.listening { Circle().fill(Color.red.opacity(0.35)).frame(width: 22 + d.level * 22, height: 22 + d.level * 22).animation(.easeOut(duration: 0.08), value: d.level) }
+                Image(systemName: d.listening ? "mic.fill" : "mic").foregroundStyle(d.listening ? Color.red : Color.white)
+            }.frame(width: 26, height: 26)
+        }.help(d.listening ? "stop dictation" : "dictate (on-device speech)")
+    }
+}
+
+struct DictationBar: View {
+    @ObservedObject var deck: Deck
+    @ObservedObject var d: Dictation
+    let controller: DeckController
+    init(deck: Deck, controller: DeckController) { self.deck = deck; self.d = deck.dictation; self.controller = controller }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "waveform").foregroundStyle(d.listening ? Color.red : Color.orange)
+                Text(d.listening ? "listening…" : "transcript").font(.system(size: 10, weight: .bold)).tracking(1).foregroundStyle(.white.opacity(0.6))
+                if !d.status.isEmpty { Text(d.status).font(.system(size: 10)).foregroundStyle(.orange) }
+                Spacer()
+                if !d.listening && !d.text.isEmpty {
+                    IconButton("doc.on.doc", tint: .teal) { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(d.text, forType: .string) }.help("copy")
+                    IconButton("checklist", tint: .purple) { controller.addTodo(d.text); d.clear() }.help("add as to-do")
+                    Menu { ForEach(deck.sessions) { s in Button("→ \(s.name)") { runAsync(["halo", "send", s.id, d.text, "--no-wait"]); d.clear() } } }
+                        label: { Image(systemName: "paperplane.fill").frame(width: 26, height: 24).background(RoundedRectangle(cornerRadius: 7).fill(Color.orange.opacity(0.3))) }
+                        .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 30).help("send to an agent")
+                    IconButton("xmark", tint: .gray) { d.clear() }
+                }
+            }
+            Text(d.text.isEmpty ? "…" : d.text).font(.system(size: 12)).lineLimit(4).frame(maxWidth: .infinity, alignment: .leading)
+                .contentTransition(.opacity).animation(.easeInOut(duration: 0.15), value: d.text)
+        }
+        .padding(10).background(RoundedRectangle(cornerRadius: 12).fill(.white.opacity(0.07)))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke((d.listening ? Color.red : Color.orange).opacity(0.5), lineWidth: 1))
+        .padding(.horizontal, 14)
+        .transition(.move(edge: .top).combined(with: .opacity))
+    }
+}
+
+// MARK: live view -------------------------------------------------------------
+
+struct LiveView: View {
+    @ObservedObject var deck: Deck
+    let controller: DeckController
+    let big: Bool
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
+                Circle().fill(deck.liveImage == nil ? Color.gray : Color.red).frame(width: 7, height: 7)
+                Text(deck.liveTitle.isEmpty ? "Claude in Chrome" : deck.liveTitle).font(.system(size: 11.5, weight: .semibold)).lineLimit(1)
+                Spacer()
+                Toggle(isOn: $deck.autoLive) { Image(systemName: "bolt.badge.automatic") }.toggleStyle(.button).help("jump to Live when Chrome actions happen")
+                if !big { Button { controller.toggleLiveWindow() } label: { Image(systemName: deck.liveWindowOpen ? "pip.exit" : "pip.enter") }.help("pop out live window") }
+            }.buttonStyle(.borderless).padding(.horizontal, 14)
+            ZStack {
+                RoundedRectangle(cornerRadius: 12).fill(.black.opacity(0.45))
+                if let img = deck.liveImage {
+                    Image(nsImage: img).resizable().aspectRatio(contentMode: .fit).clipShape(RoundedRectangle(cornerRadius: 10)).padding(4)
+                        .transition(.opacity).id(img.size.width)
+                } else {
+                    VStack(spacing: 6) {
+                        Image(systemName: "globe").font(.system(size: 26)).foregroundStyle(.white.opacity(0.3))
+                        Text("waiting for a Chrome window").font(.system(size: 11)).foregroundStyle(.white.opacity(0.45))
+                    }
+                }
+            }.frame(maxWidth: .infinity).frame(height: big ? 380 : 210).padding(.horizontal, 14)
+            .animation(.easeInOut(duration: 0.25), value: deck.liveImage == nil)
+            Text("ACTIONS").font(.system(size: 9, weight: .bold)).tracking(2).foregroundStyle(.white.opacity(0.4)).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 14)
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 4) {
+                    if deck.actions.isEmpty { Text("no tool actions yet — they appear here as agents work (Chrome actions highlighted)").font(.system(size: 11)).foregroundStyle(.white.opacity(0.45)).padding(.top, 8) }
+                    ForEach(deck.actions) { a in
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: a.isChrome ? "globe" : "wrench.and.screwdriver").font(.system(size: 10)).foregroundStyle(a.isChrome ? Color.blue : Color.white.opacity(0.5)).frame(width: 14)
+                            VStack(alignment: .leading, spacing: 1) {
+                                HStack(spacing: 6) {
+                                    Text(a.tool.replacingOccurrences(of: "chrome:", with: "")).font(.system(size: 11, weight: .bold))
+                                    Text(a.agent).font(.system(size: 9.5, weight: .semibold)).padding(.horizontal, 5).padding(.vertical, 1).background(Capsule().fill(.white.opacity(0.1)))
+                                    Spacer()
+                                    Text(a.time, style: .time).font(.system(size: 9.5)).foregroundStyle(.white.opacity(0.45))
+                                }
+                                if !a.summary.isEmpty { Text(a.summary).font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.65)).lineLimit(2) }
+                            }
+                        }.padding(.horizontal, 9).padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: 9).fill(a.isChrome ? Color.blue.opacity(0.14) : .white.opacity(0.04)))
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                }.padding(.horizontal, 14)
+                .animation(.spring(response: 0.35, dampingFraction: 0.85), value: deck.actions.map { $0.id })
+            }
+        }
+    }
+}
+
+// MARK: to-do panel -----------------------------------------------------------
+
+struct TodoPanel: View {
+    @ObservedObject var deck: Deck
+    let controller: DeckController
+    @State private var draft = ""
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 6) {
+                TextField("add a feature, command or instruction…", text: $draft, onCommit: { controller.addTodo(draft); draft = "" })
+                    .textFieldStyle(.plain).font(.system(size: 12)).padding(.horizontal, 10).padding(.vertical, 7)
+                    .background(RoundedRectangle(cornerRadius: 9).fill(.white.opacity(0.08)))
+                IconButton("plus", tint: .purple) { controller.addTodo(draft); draft = "" }
+            }.padding(.horizontal, 14)
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 5) {
+                    if deck.todos.isEmpty { Text("empty — type above, dictate with the mic, or `halo todo add \"…\"`").font(.system(size: 11)).foregroundStyle(.white.opacity(0.45)).padding(.top, 10) }
+                    ForEach(deck.todos) { t in
+                        HStack(alignment: .top, spacing: 8) {
+                            Button { controller.toggleTodo(t) } label: {
+                                Image(systemName: t.done ? "checkmark.circle.fill" : "circle").font(.system(size: 15)).foregroundStyle(t.done ? Color.green : Color.white.opacity(0.6))
+                            }.buttonStyle(.plain)
+                            Text(t.text).font(.system(size: 12)).strikethrough(t.done, color: .white.opacity(0.5)).foregroundStyle(t.done ? .white.opacity(0.45) : .white)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            Menu { ForEach(deck.sessions) { s in Button("→ \(s.name)") { controller.sendTodo(t, to: s) } } }
+                                label: { Image(systemName: "paperplane").font(.system(size: 11)).frame(width: 22, height: 22) }
+                                .menuStyle(.borderlessButton).menuIndicator(.hidden).frame(width: 24).help("send to an agent as a prompt")
+                            Button { controller.removeTodo(t) } label: { Image(systemName: "xmark").font(.system(size: 10)).foregroundStyle(.white.opacity(0.5)).frame(width: 18, height: 22) }.buttonStyle(.plain)
+                        }.padding(.horizontal, 10).padding(.vertical, 7)
+                        .background(RoundedRectangle(cornerRadius: 10).fill(t.done ? .white.opacity(0.03) : .white.opacity(0.07)))
+                        .transition(.asymmetric(insertion: .move(edge: .top).combined(with: .opacity), removal: .opacity.combined(with: .scale(scale: 0.9))))
+                    }
+                }.padding(.horizontal, 14)
+            }
+            if deck.todos.contains(where: { $0.done }) {
+                Button("clear completed") { withAnimation { deck.todos.removeAll { $0.done } }; controller.saveTodos() }.font(.system(size: 10.5)).buttonStyle(.borderless).foregroundStyle(.white.opacity(0.6))
+            }
         }
     }
 }

@@ -1,6 +1,6 @@
 # halo
 
-![version](https://img.shields.io/badge/version-0.3.0-orange) macOS 14+ · Swift (AppKit/SwiftUI/Charts/PDFKit) + Python 3 stdlib · no dependencies
+![version](https://img.shields.io/badge/version-0.4.0-orange) macOS 14+ · Swift (AppKit/SwiftUI/Charts/PDFKit) + Python 3 stdlib · no dependencies
 
 **Install:** open `dist/Halo-<version>.dmg` (or `./build.sh`), drag Halo to Applications, launch once — it symlinks the `halo` CLI into `~/.local/bin` and `/opt/homebrew/bin` and opens the deck. Or just `ln -s $PWD/halo /opt/homebrew/bin/halo`.
 
@@ -82,3 +82,20 @@ terminal; App gives paste injection + screenshots in the desktop app.
 ## Versioning
 `VERSION` is the single source: `halo --version`, the HUD header, `Info.plist` and the DMG name all read it.
 Bump it, run `./build.sh`, commit.
+
+## Copy, paste, to-do, live view, mic (v0.4)
+
+- **Copy/paste built in.** In every halo terminal, drag-selecting text copies it to the macOS clipboard
+  (tmux `copy-pipe` → `pbcopy`); ⌘V pastes. `halo copy NAME` copies the agent's last answer as *clean text*
+  (Claude Code boxes, spinners, status line stripped; `--all` for the whole scrollback, `--raw` unfiltered,
+  `--print` to stdout). `halo paste NAME` sends the clipboard as a prompt. Both have buttons on each agent card.
+- **To-do.** `halo todo add "…" | list | done N | undone N | rm N | send N AGENT | clear` and the To-do tab
+  in the HUD share `~/.halo/todo.json`. Any item can be sent to an agent as a prompt (paper-plane menu),
+  ticked off, or removed. Works from inside any Claude/Codex CLI too — it's the same `halo` binary.
+- **Live view.** The Live tab (and the pop-out window) streams the Chrome window Claude in Chrome is driving
+  (ScreenCaptureKit, ~2 fps) and lists every tool action any agent takes, parsed from the transcripts —
+  Chrome actions (navigate, click, type, screenshot…) are highlighted. With ⚡ auto on, the sidebar jumps to
+  Live when a Chrome action happens.
+- **Mic.** The mic button dictates on-device (Apple Speech, `en-IN`). While listening, the transcript grows
+  live; when you stop, send it to any agent, add it as a to-do, or copy it. Needs Microphone + Speech
+  Recognition permission the first time.
