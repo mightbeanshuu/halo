@@ -454,7 +454,7 @@ def cmd_full(a):
             prev = osa('tell application "System Events" to get {autohide, autohide menu bar} of dock preferences')
             with open(FOCUS_FILE, "w") as f:
                 json.dump({"prev": prev, "since": time.time()}, f)
-            osa('tell application "System Events" to tell dock preferences to set {autohide, autohide menu bar} to {true, true}')
+            osa('tell application "System Events" to tell dock preferences\nset autohide to true\nset autohide menu bar to true\nend tell')
         if deck_pid():
             with open(os.path.join(DIR, "deck.cmd"), "a") as f:
                 f.write("clean on\nfocus on\n")
@@ -469,8 +469,11 @@ def cmd_full(a):
             except (OSError, ValueError):
                 prev = "false, false"
             a1, a2 = [x.strip() for x in prev.split(",")][:2]
-            osa(f'tell application "System Events" to tell dock preferences to set {{autohide, autohide menu bar}} to {{{a1}, {a2}}}')
+            osa(f'tell application "System Events" to tell dock preferences\nset autohide to {a1}\nset autohide menu bar to {a2}\nend tell')
             os.remove(FOCUS_FILE)
+        else:
+            # not in focus mode as far as we know: still make sure nothing stays hidden
+            osa('tell application "System Events" to tell dock preferences\nset autohide to false\nset autohide menu bar to false\nend tell')
         if deck_pid():
             with open(os.path.join(DIR, "deck.cmd"), "a") as f:
                 f.write("focus off\n")

@@ -919,6 +919,11 @@ final class DeckController {
         }
     }
 
+    func quit() {
+        if deck.focus || FileManager.default.fileExists(atPath: HALO_DIR + "/focus.json") { run(["halo", "full", "off"]) }   // never leave the Dock hidden
+        NSApp.terminate(nil)
+    }
+
     func setFocus(_ on: Bool, fromCLI: Bool = false) {
         deck.focus = on
         if on { deck.clean = true }
@@ -1013,7 +1018,7 @@ struct HUDView: View {
                 Toggle(isOn: $deck.clean) { Image(systemName: "rectangle.dashed") }.toggleStyle(.button).help("clean backdrop")
                 Toggle(isOn: $deck.autoTile) { Image(systemName: "rectangle.3.group") }.toggleStyle(.button).help("auto-align windows")
                 Button { controller.tile() } label: { Image(systemName: "square.grid.2x2") }.help("tile windows")
-                Button { NSApp.terminate(nil) } label: { Image(systemName: "xmark") }.help("quit deck")
+                Button { controller.quit() } label: { Image(systemName: "xmark") }.help("quit deck")
             }.buttonStyle(.borderless).padding(.horizontal, 16)
 
             HStack(spacing: 12) {
@@ -1532,4 +1537,8 @@ app.setActivationPolicy(.accessory)
 let controller = DeckController(orch: orchArg, orchSession: orchSessionArg, clean: cleanArg)
 try? String(ProcessInfo.processInfo.processIdentifier).write(toFile: HALO_DIR + "/deck.pid", atomically: true, encoding: .utf8)
 if focusArg { controller.setFocus(true, fromCLI: true) }
+signal(SIGTERM) { _ in
+    if FileManager.default.fileExists(atPath: HALO_DIR + "/focus.json") { run(["halo", "full", "off"]) }
+    exit(0)
+}
 app.run()
